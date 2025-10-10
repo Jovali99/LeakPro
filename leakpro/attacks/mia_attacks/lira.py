@@ -118,51 +118,60 @@ class AttackLiRA(AbstractMIA):
         self.attack_data_indices = self.sample_indices_from_population(include_train_indices = self.online,
                                                                        include_test_indices = self.online)
 
-        self.shadow_model_indices = ShadowModelHandler().create_shadow_models(num_models = self.num_shadow_models,
-                                                                              shadow_population =  self.attack_data_indices,
-                                                                              training_fraction = self.training_data_fraction,
-                                                                              online = self.online)
-
-        self.shadow_models, _ = ShadowModelHandler().get_shadow_models(self.shadow_model_indices)
-
-        logger.info("Create masks for all IN and OUT samples")
-        self.in_indices_masks = ShadowModelHandler().get_in_indices_mask(self.shadow_model_indices, self.audit_dataset["data"])
-
-        if self.online:
-            # Exclude all audit points that have either no IN or OUT samples
-            num_shadow_models_seen_points = np.sum(self.in_indices_masks, axis=1)
-            mask = (num_shadow_models_seen_points > 0) & (num_shadow_models_seen_points < self.num_shadow_models)
-
-            # Filter the audit data
-            self.audit_data_indices = self.audit_dataset["data"][mask]
-            self.in_indices_masks = self.in_indices_masks[mask, :]
-
-            # Filter IN and OUT members
-            self.in_members = np.arange(np.sum(mask[self.audit_dataset["in_members"]]))
-            num_out_members = np.sum(mask[self.audit_dataset["out_members"]])
-            self.out_members = np.arange(len(self.in_members), len(self.in_members) + num_out_members)
-
-            assert len(self.audit_data_indices) == len(self.in_members) + len(self.out_members)
-
-            if len(self.audit_data_indices) == 0:
-                raise ValueError("No points in the audit dataset are used for the shadow models")
-
+        # Check for existing logits
+        if( not run_with_optuna and self.logits_utils().logits_exist(config_hash)):
+            # load existing shadow model logits and evaluate the score
+            logger.info(f"Found cached logits for config {config_hash} — skipping shadow model training.")
+            self.load_logits(config_hash)
         else:
-            self.audit_data_indices = self.audit_dataset["data"]
-            self.in_members = self.audit_dataset["in_members"]
-            self.out_members = self.audit_dataset["out_members"]
+            # Train and compute shadow model logits
+            self.shadow_model_indices = ShadowModelHandler().create_shadow_models(num_models = self.num_shadow_models,
+                                                                                  shadow_population =  self.attack_data_indices,
+                                                                                  training_fraction = self.training_data_fraction,
+                                                                                  online = self.online)
 
-        # Check offline attack for possible IN- sample(s)
-        if not self.online:
-            count_in_samples = np.count_nonzero(self.in_indices_masks)
-            if count_in_samples > 0:
-                logger.info(f"Some shadow model(s) contains {count_in_samples} IN samples in total for the model(s)")
-                logger.info("This is not an offline attack!")
+            self.shadow_models, _ = ShadowModelHandler().get_shadow_models(self.shadow_model_indices)
 
-        logger.info(f"Calculating the logits for all {self.num_shadow_models} shadow models")
-        self.shadow_models_logits = np.swapaxes(self.signal(self.shadow_models,
-                                                            self.handler,
-                                                            self.audit_data_indices), 0, 1)
+            logger.info("Create masks for all IN and OUT samples")
+            self.in_indices_masks = ShadowModelHandler().get_in_indices_mask(self.shadow_model_indices, self.audit_dataset["data"])
+
+            if self.online:
+                # Exclude all audit points that have either no IN or OUT samples
+                num_shadow_models_seen_points = np.sum(self.in_indices_masks, axis=1)
+                mask = (num_shadow_models_seen_points > 0) & (num_shadow_models_seen_points < self.num_shadow_models)
+
+                # Filter the audit data
+                self.audit_data_indices = self.audit_dataset["data"][mask]
+                self.in_indices_masks = self.in_indices_masks[mask, :]
+
+                # Filter IN and OUT members
+                self.in_members = np.arange(np.sum(mask[self.audit_dataset["in_members"]]))
+                num_out_members = np.sum(mask[self.audit_dataset["out_members"]])
+                self.out_members = np.arange(len(self.in_members), len(self.in_members) + num_out_members)
+
+                assert len(self.audit_data_indices) == len(self.in_members) + len(self.out_members)
+
+                if len(self.audit_data_indices) == 0:
+                    raise ValueError("No points in the audit dataset are used for the shadow models")
+
+            else:
+                self.audit_data_indices = self.audit_dataset["data"]
+                self.in_members = self.audit_dataset["in_members"]
+                self.out_members = self.audit_dataset["out_members"]
+
+            # Check offline attack for possible IN- sample(s)
+            if not self.online:
+                count_in_samples = np.count_nonzero(self.in_indices_masks)
+                if count_in_samples > 0:
+                    logger.info(f"Some shadow model(s) contains {count_in_samples} IN samples in total for the model(s)")
+                    logger.info("This is not an offline attack!")
+
+            logger.info(f"Calculating the logits for all {self.num_shadow_models} shadow models")
+            self.shadow_models_logits = np.swapaxes(self.signal(self.shadow_models,
+                                                                self.handler,
+                                                                self.audit_data_indices), 0, 1)
+
+            self.save_logits(config_hash)
 
         # Calculate logits for the target model
         logger.info("Calculating the logits for the target model")
