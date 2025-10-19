@@ -1,5 +1,6 @@
 """Implementation of the LiRA attack."""
 
+from abc import ABC, abstractmethod
 from typing import Literal
 
 import numpy as np
@@ -12,13 +13,8 @@ from leakpro.attacks.utils.shadow_model_handler import ShadowModelHandler
 from leakpro.input_handler.mia_handler import MIAHandler
 from leakpro.reporting.mia_result import MIAResult
 from leakpro.utils.import_helper import Self
-<<<<<<< HEAD
 from leakpro.utils.logger import logger
 from leakpro.attacks.mia_attacks.lira_versions import lira_vectorized, lira_iterative
-
-=======
-from leakpro.attacks.mia_attacks.lira_versions import lira_vectorized, lira_iterative
->>>>>>> 1f175c0cd4089a9f0ca705177a3f98417e6c62e5
 
 class AttackLiRA(AbstractMIA):
     """Implementation of the LiRA attack."""
@@ -153,7 +149,6 @@ class AttackLiRA(AbstractMIA):
         for indx in self.shadow_model_indices:
             self.shadow_models_logits.append(ShadowModelHandler().load_logits(indx=indx))
 
-<<<<<<< HEAD
             # Filter IN and OUT members
             self.in_members = np.arange(np.sum(mask[self.audit_dataset["in_members"]]))
             num_out_members = np.sum(mask[self.audit_dataset["out_members"]])
@@ -227,10 +222,6 @@ class AttackLiRA(AbstractMIA):
             self.target_logits = self.target_logits[memorization_mask]
 
         return np.array([None])
-=======
-        self.shadow_models_logits = np.array([self.rescale_logits(x, true_labels) for x in self.shadow_models_logits])
-        self.target_logits = self.rescale_logits(self.target_logits, true_labels)
->>>>>>> 1f175c0cd4089a9f0ca705177a3f98417e6c62e5
 
     def run_attack(self:Self) -> MIAResult:
         """Runs the attack on the target model and dataset and assess privacy risks or data leakage.
@@ -249,18 +240,11 @@ class AttackLiRA(AbstractMIA):
         score = np.zeros(n_audit_samples)  # List to hold the computed probability scores for each sample
 
         #  Decides which score calculation method should be used
-        if(self.vectorized):
-            score = lira_vectorized.lira_vectorized(self.shadow_models_logits,
-                                                self.target_logits,
-                                                self.in_indices_masks,
-                                                self.var_calculation,
-                                                self.online)
-        else:
-            score = lira_iterative.lira_iterative(self.shadow_models_logits,
-                                                self.target_logits,
-                                                self.in_indices_masks,
-                                                self.var_calculation,
-                                                self.online)
+        lira_strategy = self.LiraVectorized if self.vectorized else self.LiraIterative
+        self.strategy = lira_strategy(var_calculation=self.var_calculation, online=self.online)
+
+        # Calculates the score using the chosen strategy
+        score = self.strategy.compute(self.shadow_models_logits, self.target_logits, self.in_indices_masks)
 
         # Split the score array into two parts based on membership: in (training) and out (non-training)
         in_members = self.audit_dataset["in_members"]
@@ -281,3 +265,277 @@ class AttackLiRA(AbstractMIA):
                                     signal_values=signal_values,
                                     result_name="LiRA",
                                     metadata=self.configs.model_dump())
+
+    # -------------------------------------------
+    #   LiRA strategy base and scoring strategies
+    # -------------------------------------------
+
+    class LiraBase(ABC):
+        """Abstract base class for LiRA scoring strategies"""
+
+        def __init__(self, var_calculation: str ="carlini", online: bool = False, fix_var_threshold: int = 32):
+            self.var_calculation = var_calculation
+            self.online = online
+            self.fix_var_threshold = fix_var_threshold
+
+        @abstractmethod
+        def compute(self, shadow_models_logits: np.ndarray, target_logits: np.ndarray, in_indices_masks: np.ndarray) -> np.ndarray:
+            """
+            Compute LiRA scores. Return 1D array of length n_samples.
+
+            Parameters
+            ----------
+            shadow_models_logits : np.ndarray
+                Array of shape (N, M), where N = audit samples and M = shadow models.
+            target_logits : np.ndarray
+                Array of shape (N,), logits of the target model for audit samples.
+            in_indices_masks : np.ndarray
+                Boolean mask of shape (N, M). True for IN (member) shadow models.
+
+            Returns
+            -------
+            np.ndarray
+                LiRA scores per audit sample.
+            """
+            raise NotImplementedError
+
+        def _validate_inputs(self, shadow_models_logits: np.ndarray, target_logits: np.ndarray, in_indices_masks: np.ndarray):
+            if shadow_models_logits.ndim != 2:
+                raise ValueError("shadow_models_logits must be a 2D array (n_samples, n_shadow_models)")
+            if in_indices_masks.shape != shadow_models_logits.shape:
+                raise ValueError("in_indices_masks must have the same shape as shadow_models_logits")
+            if target_logits.ndim != 1 or target_logits.shape[0] != shadow_models_logits.shape[0]:
+                raise ValueError("target_logits must be a 1D array with length equal to number of samples")
+
+
+
+    class LiraVectorized(LiraBase):
+        """Compute LiRA scores in a fully vectorized manner."""
+
+        def compute(self, shadow_models_logits: np.ndarray, target_logits: np.ndarray, in_indices_masks: np.ndarray) -> np.ndarray:
+
+            self._validate_inputs(shadow_models_logits, target_logits, in_indices_masks)
+
+            n_samples, num_shadow_models = shadow_models_logits.shape
+
+            # Computes the fixed in and out variances
+            fixed_in_std, fixed_out_std = self._compute_fixed_stds(shadow_models_logits, in_indices_masks)
+
+            # Vectorized mean calculation
+            out_means = np.nanmean(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
+            in_means = np.nanmean(np.where(in_indices_masks, shadow_models_logits, np.nan), axis=1)
+
+            # Replace NaNs in means with 0.0
+            out_means = np.where(np.isnan(out_means), 0.0, out_means)
+            in_means  = np.where(np.isnan(in_means),  0.0, in_means)
+
+            # Cast to lowercase
+            var_calc = self.var_calculation.lower()
+
+            if(var_calc== "fixed"):
+                in_stds, out_stds = self._vectorized_fixed_variance(in_indices_masks, shadow_models_logits,)
+            elif(var_calc == "carlini"):
+                in_stds, out_stds = self._vectorized_carlini_variance(in_indices_masks,
+                                                                shadow_models_logits,
+                                                                num_shadow_models,
+                                                                fixed_out_std,
+                                                                fixed_in_std)
+
+            elif(var_calc == "individual_carlini"):
+                in_stds, out_stds = self._vectorized_individual_carlini(in_indices_masks,
+                                                                  shadow_models_logits,
+                                                                  fixed_out_std,
+                                                                  fixed_in_std)
+            else:
+                raise ValueError(f"Unknown var_calculation: {self.var_calculation!r}")
+
+            # Vectorized logpdf
+            pr_out = norm.logpdf(target_logits, out_means, out_stds + 1e-30)
+            pr_in  = norm.logpdf(target_logits, in_means, in_stds + 1e-30) if self.online else np.zeros(n_samples)
+
+            # Final LiRA score per audit sample
+            scores = pr_in - pr_out
+            
+            # Debug helper
+            if np.any(np.isnan(scores)):
+                nan_idx = np.where(np.isnan(scores))[0]
+                raise ValueError(f"NaN in vectorized scores at indices {nan_idx.tolist()}")
+
+            return scores
+
+        def _vectorized_fixed_variance(self, in_indices_masks, shadow_models_logits) -> tuple[np.ndarray, np.ndarray]:
+            """
+            Compute per-sample IN and OUT standard deviations using fixed variance mode.
+
+            Returns
+            -------
+                (in_stds, out_stds) arrays of shape (N,).
+            """
+
+            out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
+            in_stds  = np.nanstd(np.where(in_indices_masks,  shadow_models_logits, np.nan), axis=1)
+
+            if not self.online:
+                in_stds[:] = 0.0
+
+            return in_stds, out_stds
+
+        def _vectorized_carlini_variance(self, in_indices_masks, shadow_models_logits,
+                                        num_shadow_models, fixed_out_std,
+                                        fixed_in_std) -> tuple[np.ndarray, np.ndarray]:
+            """
+            Compute per-sample IN/OUT standard deviations using Carlini variance method.
+
+            Returns
+            -------
+                (in_stds, out_stds) arrays of shape (N,).
+            """
+
+            n_samples = shadow_models_logits.shape[0]
+            if num_shadow_models >= self.fix_var_threshold * 2:
+                out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
+                in_stds  = np.nanstd(np.where(in_indices_masks,  shadow_models_logits, np.nan), axis=1)
+            else:
+                out_stds = np.full(n_samples, fixed_out_std)
+                in_stds  = np.full(n_samples, fixed_in_std) if self.online else np.zeros(n_samples)
+
+            return in_stds, out_stds
+
+        def _vectorized_individual_carlini(self, in_indices_masks, shadow_models_logits,
+                                          fixed_out_std, fixed_in_std) -> tuple[np.ndarray, np.ndarray]:
+            """
+            Compute per-sample IN/OUT standard deviations using individual Carlini variance.
+
+            Variance is computed per audit sample; samples with fewer than
+            fix_var_threshold contributing shadow models use fixed variance instead.
+
+            Returns
+            -------
+                (in_stds, out_stds) arrays of shape (N,).
+            """
+
+            out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
+            in_stds  = np.nanstd(np.where(in_indices_masks,  shadow_models_logits, np.nan), axis=1)
+
+            out_counts = np.sum(~in_indices_masks, axis=1)
+            in_counts  = np.sum(in_indices_masks,  axis=1)
+
+            out_stds = np.where(out_counts >= self.fix_var_threshold, out_stds, fixed_out_std)
+            in_stds  = np.where(in_counts  >= self.fix_var_threshold, in_stds,  fixed_in_std)
+
+            if not self.online:
+                in_stds[:] = 0.0
+
+            return in_stds, out_stds
+
+        def _compute_fixed_stds(self, shadow_models_logits, in_indices_masks) -> tuple[float, float]:
+            """
+            Compute global fixed in and out standard deviations
+
+            Returns
+            -------
+                If there are no IN or no OUT values, the corresponding std is 0.0.
+            """
+            in_vals  = shadow_models_logits[in_indices_masks]
+            out_vals = shadow_models_logits[~in_indices_masks]
+            fixed_in_std = np.std(in_vals) if in_vals.size > 0 else 0.0
+            fixed_out_std = np.std(out_vals) if out_vals.size > 0 else 0.0
+
+            return fixed_in_std, fixed_out_std
+
+
+    class LiraIterative(LiraBase):
+        """Compute LiRA scores in an iterative manner."""
+
+        def compute(self, shadow_models_logits: np.ndarray, target_logits: np.ndarray, in_indices_masks: np.ndarray) -> np.ndarray:
+            self._validate_inputs(shadow_models_logits, target_logits, in_indices_masks)
+
+            n_audit_samples, num_shadow_models = shadow_models_logits.shape
+            score = np.zeros(n_audit_samples)  # List to hold the computed probability scores for each sample
+
+            fixed_in_std, fixed_out_std = self._compute_fixed_stds(shadow_models_logits, in_indices_masks)
+
+            # Iterate over and extract logits for IN and OUT shadow models for each audit sample
+            for i, (shadow_models_logits, mask) in tqdm(enumerate(zip(shadow_models_logits, in_indices_masks)),
+                                                        total=len(shadow_models_logits),
+                                                        desc="Processing audit samples"):
+
+                # Calculate the mean for OUT shadow model logits
+                out_mean = np.mean(shadow_models_logits[~mask])
+                out_std = self._get_std(shadow_models_logits, ~mask, False,
+                                  num_shadow_models, fixed_in_std, fixed_out_std)
+
+                # Get the logit from the target model for the current sample
+                target_logit = target_logits[i]
+
+                # Calculate the log probability density function value
+                pr_out = norm.logpdf(target_logit, out_mean, out_std + 1e-30)
+
+                if self.online:
+                    in_mean = np.mean(shadow_models_logits[mask])
+                    in_std = self._get_std(shadow_models_logits, mask, True,
+                                     num_shadow_models, fixed_in_std, fixed_out_std)
+
+                    pr_in = norm.logpdf(target_logit, in_mean, in_std + 1e-30)
+                else:
+                    pr_in = 0
+
+                score[i] = (pr_in - pr_out)  # Append the calculated probability density value to the score list
+                if np.isnan(score[i]):
+                    raise ValueError("Score is NaN")
+            return score
+
+
+        def _get_std(self, logits: np.ndarray, mask: np.ndarray, is_in: bool,
+                    num_shadow_models, fixed_in_std, fixed_out_std) -> np.ndarray:
+            """A function to define what method to use for calculating variance for LiRA."""
+
+            # Cast to lowercase
+            var_calc = self.var_calculation.lower()
+
+            # Fixed/Global variance calculation.
+            if var_calc== "fixed":
+                return self._fixed_variance(logits, mask, is_in)
+
+            # Variance calculation as in the paper ( Membership Inference Attacks From First Principles )
+            elif var_calc== "carlini":
+                return self._carlini_variance(logits, mask, is_in, num_shadow_models,
+                                              fixed_in_std, fixed_out_std)
+
+            # Variance calculation as in the paper ( Membership Inference Attacks From First Principles )
+            #   but check IN and OUT samples individualy
+            elif var_calc== "individual_carlini":
+                return self._individual_carlini(logits, mask, is_in, fixed_in_std, fixed_out_std)
+
+            return np.array([None])
+
+        def _fixed_variance(self, logits: np.ndarray, mask: np.ndarray, is_in: bool) -> np.ndarray:
+            if is_in and not self.online:
+                return np.array([None])
+            return np.std(logits[mask])
+
+        def _carlini_variance(self, logits: np.ndarray, mask: np.ndarray, is_in: bool,
+                              num_shadow_models, fixed_in_std,
+                              fixed_out_std) -> np.ndarray:
+
+            if num_shadow_models >= self.fix_var_threshold*2:
+                    return np.std(logits[mask])
+            if is_in:
+                return fixed_in_std
+            return fixed_out_std
+
+        def _individual_carlini(self, logits: np.ndarray, mask: np.ndarray, is_in: bool,
+                                fixed_in_std, fixed_out_std) -> np.ndarray:
+
+            if np.count_nonzero(mask) >= self.fix_var_threshold:
+                return np.std(logits[mask])
+
+            return fixed_in_std if is_in else fixed_out_std
+
+        def _compute_fixed_stds(self, logits: np.ndarray, masks: np.ndarray) -> tuple[float, float]:
+            """Compute global fallback IN/OUT standard deviations across all samples."""
+
+            in_vals  = logits[masks]
+            out_vals = logits[~masks]
+
+            return np.std(in_vals), np.std(out_vals)
