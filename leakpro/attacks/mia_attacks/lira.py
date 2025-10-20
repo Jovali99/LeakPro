@@ -13,7 +13,7 @@ from leakpro.attacks.utils.shadow_model_handler import ShadowModelHandler
 from leakpro.input_handler.mia_handler import MIAHandler
 from leakpro.reporting.mia_result import MIAResult
 from leakpro.utils.import_helper import Self
-from leakpro.utils.logger import logger
+
 
 class AttackLiRA(AbstractMIA):
     """Implementation of the LiRA attack."""
@@ -152,79 +152,8 @@ class AttackLiRA(AbstractMIA):
         for indx in self.shadow_model_indices:
             self.shadow_models_logits.append(ShadowModelHandler().load_logits(indx=indx))
 
-            # Filter IN and OUT members
-            self.in_members = np.arange(np.sum(mask[self.audit_dataset["in_members"]]))
-            num_out_members = np.sum(mask[self.audit_dataset["out_members"]])
-            self.out_members = np.arange(len(self.in_members), len(self.in_members) + num_out_members)
-
-            assert len(self.audit_data_indices) == len(self.in_members) + len(self.out_members)
-
-            if len(self.audit_data_indices) == 0:
-                raise ValueError("No points in the audit dataset are used for the shadow models")
-
-        else:
-            self.audit_data_indices = self.audit_dataset["data"]
-            self.in_members = self.audit_dataset["in_members"]
-            self.out_members = self.audit_dataset["out_members"]
-
-        # Check offline attack for possible IN- sample(s)
-        if not self.online:
-            count_in_samples = np.count_nonzero(self.in_indices_masks)
-            if count_in_samples > 0:
-                logger.info(f"Some shadow model(s) contains {count_in_samples} IN samples in total for the model(s)")
-                logger.info("This is not an offline attack!")
-
-        logger.info(f"Calculating the logits for all {self.num_shadow_models} shadow models")
-        self.shadow_models_logits = np.swapaxes(self.signal(self.shadow_models,
-                                                            self.handler,
-                                                            self.audit_data_indices), 0, 1)
-
-        # Calculate logits for the target model
-        logger.info("Calculating the logits for the target model")
-        self.target_logits = np.swapaxes(self.signal([self.target_model],
-                                                     self.handler,
-                                                     self.audit_data_indices), 0, 1).squeeze()
-
-        # Using Memorizationg boosting
-        if self.memorization:
-
-            # Prepare for memorization
-            org_audit_data_length = self.audit_data_indices.size
-            audit_data_labels = self.handler.get_labels(self.audit_data_indices)
-
-            logger.info("Running memorization")
-            memorization = Memorization(
-                self.use_privacy_score,
-                self.memorization_threshold,
-                self.min_num_memorization_audit_points,
-                self.num_memorization_audit_points,
-                self.in_indices_masks,
-                self.shadow_models,
-                self.target_model,
-                self.audit_data_indices,
-                audit_data_labels,
-                org_audit_data_length,
-                self.handler,
-                self.online,
-            )
-            memorization_mask, _, _ = memorization.run()
-
-            # Filter masks
-            self.in_indices_masks = self.in_indices_masks[memorization_mask, :]
-
-            # Filter IN and OUT members
-            self.in_members = np.arange(np.sum(memorization_mask[self.in_members]))
-            num_out_members = np.sum(memorization_mask[self.out_members])
-            self.out_members = np.arange(len(self.in_members), len(self.in_members) + num_out_members)
-
-            assert len(self.out_members) > 0
-            assert len(self.in_members) > 0
-
-            # Filter logits
-            self.shadow_models_logits = self.shadow_models_logits[memorization_mask, :]
-            self.target_logits = self.target_logits[memorization_mask]
-
-        return np.array([None])
+        self.shadow_models_logits = np.array([self.rescale_logits(x, true_labels) for x in self.shadow_models_logits])
+        self.target_logits = self.rescale_logits(self.target_logits, true_labels)
 
     def run_attack(self:Self) -> MIAResult:
         """Runs the attack on the target model and dataset and assess privacy risks or data leakage.
@@ -306,7 +235,20 @@ class AttackLiRA(AbstractMIA):
             if target_logits.ndim != 1 or target_logits.shape[0] != shadow_models_logits.shape[0]:
                 raise ValueError("target_logits must be a 1D array with length equal to number of samples")
 
+        def _compute_fixed_stds(self, shadow_models_logits, in_indices_masks) -> tuple[float, float]:
+            """
+            Compute global fixed in and out standard deviations
 
+            Returns
+            -------
+                If there are no IN or no OUT values, the corresponding std is 0.0.
+            """
+            in_vals  = shadow_models_logits[in_indices_masks]
+            out_vals = shadow_models_logits[~in_indices_masks]
+            fixed_in_std = np.std(in_vals) if in_vals.size > 0 else 0.0
+            fixed_out_std = np.std(out_vals) if out_vals.size > 0 else 0.0
+
+            return fixed_in_std, fixed_out_std
 
     class LiraVectorized(LiraBase):
         """Compute LiRA scores in a fully vectorized manner."""
@@ -331,7 +273,7 @@ class AttackLiRA(AbstractMIA):
             # Cast to lowercase
             var_calc = self.var_calculation.lower()
 
-            if(var_calc== "fixed"):
+            if(var_calc == "fixed"):
                 in_stds, out_stds = self._vectorized_fixed_variance(in_indices_masks, shadow_models_logits,)
             elif(var_calc == "carlini"):
                 in_stds, out_stds = self._vectorized_carlini_variance(in_indices_masks,
@@ -370,7 +312,6 @@ class AttackLiRA(AbstractMIA):
             -------
                 (in_stds, out_stds) arrays of shape (N,).
             """
-
             out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
             in_stds  = np.nanstd(np.where(in_indices_masks,  shadow_models_logits, np.nan), axis=1)
 
@@ -389,7 +330,6 @@ class AttackLiRA(AbstractMIA):
             -------
                 (in_stds, out_stds) arrays of shape (N,).
             """
-
             n_samples = shadow_models_logits.shape[0]
             if num_shadow_models >= self.fix_var_threshold * 2:
                 out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
@@ -412,7 +352,6 @@ class AttackLiRA(AbstractMIA):
             -------
                 (in_stds, out_stds) arrays of shape (N,).
             """
-
             out_stds = np.nanstd(np.where(~in_indices_masks, shadow_models_logits, np.nan), axis=1)
             in_stds  = np.nanstd(np.where(in_indices_masks,  shadow_models_logits, np.nan), axis=1)
 
@@ -426,22 +365,6 @@ class AttackLiRA(AbstractMIA):
                 in_stds[:] = 0.0
 
             return in_stds, out_stds
-
-        def _compute_fixed_stds(self, shadow_models_logits, in_indices_masks) -> tuple[float, float]:
-            """
-            Compute global fixed in and out standard deviations
-
-            Returns
-            -------
-                If there are no IN or no OUT values, the corresponding std is 0.0.
-            """
-            in_vals  = shadow_models_logits[in_indices_masks]
-            out_vals = shadow_models_logits[~in_indices_masks]
-            fixed_in_std = np.std(in_vals) if in_vals.size > 0 else 0.0
-            fixed_out_std = np.std(out_vals) if out_vals.size > 0 else 0.0
-
-            return fixed_in_std, fixed_out_std
-
 
     class LiraIterative(LiraBase):
         """Compute LiRA scores in an iterative manner."""
@@ -484,7 +407,6 @@ class AttackLiRA(AbstractMIA):
                     raise ValueError("Score is NaN")
             return score
 
-
         def _get_std(self, logits: np.ndarray, mask: np.ndarray, is_in: bool,
                     num_shadow_models, fixed_in_std, fixed_out_std) -> np.ndarray:
             """A function to define what method to use for calculating variance for LiRA."""
@@ -493,17 +415,17 @@ class AttackLiRA(AbstractMIA):
             var_calc = self.var_calculation.lower()
 
             # Fixed/Global variance calculation.
-            if var_calc== "fixed":
+            if var_calc == "fixed":
                 return self._fixed_variance(logits, mask, is_in)
 
             # Variance calculation as in the paper ( Membership Inference Attacks From First Principles )
-            elif var_calc== "carlini":
+            elif var_calc == "carlini":
                 return self._carlini_variance(logits, mask, is_in, num_shadow_models,
                                               fixed_in_std, fixed_out_std)
 
             # Variance calculation as in the paper ( Membership Inference Attacks From First Principles )
             #   but check IN and OUT samples individualy
-            elif var_calc== "individual_carlini":
+            elif var_calc == "individual_carlini":
                 return self._individual_carlini(logits, mask, is_in, fixed_in_std, fixed_out_std)
 
             return np.array([None])
@@ -530,11 +452,3 @@ class AttackLiRA(AbstractMIA):
                 return np.std(logits[mask])
 
             return fixed_in_std if is_in else fixed_out_std
-
-        def _compute_fixed_stds(self, logits: np.ndarray, masks: np.ndarray) -> tuple[float, float]:
-            """Compute global fallback IN/OUT standard deviations across all samples."""
-
-            in_vals  = logits[masks]
-            out_vals = logits[~masks]
-
-            return np.std(in_vals), np.std(out_vals)
