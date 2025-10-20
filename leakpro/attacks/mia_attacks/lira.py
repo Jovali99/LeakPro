@@ -227,7 +227,6 @@ class AttackLiRA(AbstractMIA):
             """
             raise NotImplementedError
         
-        # TODO FIX THE VALIDATION
         def _validate_inputs(self, shadow_models_logits: np.ndarray, target_logits: np.ndarray, out_indices: np.ndarray):
             if shadow_models_logits.ndim != 2:
                 raise ValueError("shadow_models_logits must be a 2D array (n_shadow_models, n_samples)")
