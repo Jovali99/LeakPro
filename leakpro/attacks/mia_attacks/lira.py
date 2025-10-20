@@ -14,7 +14,6 @@ from leakpro.input_handler.mia_handler import MIAHandler
 from leakpro.reporting.mia_result import MIAResult
 from leakpro.utils.import_helper import Self
 from leakpro.utils.logger import logger
-from leakpro.attacks.mia_attacks.lira_versions import lira_vectorized, lira_iterative
 
 class AttackLiRA(AbstractMIA):
     """Implementation of the LiRA attack."""
