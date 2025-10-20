@@ -68,6 +68,10 @@ class AttackLiRA(AbstractMIA):
 
         self.shadow_models = []
 
+        # Decides which score calculation method should be used
+        lira_strategy = AttackLiRA.LiraVectorized if self.vectorized else AttackLiRA.LiraIterative
+        self.strategy = lira_strategy(var_calculation=self.var_calculation, online=self.online)
+
     def description(self:Self) -> dict:
         """Return a description of the attack."""
         title_str = "Likelihood Ratio Attack"
@@ -239,11 +243,7 @@ class AttackLiRA(AbstractMIA):
         n_audit_samples = self.shadow_models_logits.shape[1]
         score = np.zeros(n_audit_samples)  # List to hold the computed probability scores for each sample
 
-        #  Decides which score calculation method should be used
-        lira_strategy = self.LiraVectorized if self.vectorized else self.LiraIterative
-        self.strategy = lira_strategy(var_calculation=self.var_calculation, online=self.online)
-
-        # Calculates the score using the chosen strategy
+        # Calculates the score using the initialized strategy
         score = self.strategy.compute(self.shadow_models_logits, self.target_logits, self.in_indices_masks)
 
         # Split the score array into two parts based on membership: in (training) and out (non-training)
