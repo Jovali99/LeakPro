@@ -214,11 +214,11 @@ class AttackLiRA(AbstractMIA):
             Parameters
             ----------
             shadow_models_logits : np.ndarray
-                Array of shape (N, M), where N = audit samples and M = shadow models.
+                Array of shape (N, N), where N = audit samples and M = shadow models.
             target_logits : np.ndarray
                 Array of shape (N,), logits of the target model for audit samples.
-            in_indices_masks : np.ndarray
-                Boolean mask of shape (N, M). True for IN (member) shadow models.
+            out_indices: np.ndarray
+                Boolean mask of shape (M, N). True for Out (member) shadow models.
 
             Returns
             -------
